@@ -1,7 +1,9 @@
-#![allow(unused)]
+use clap::Parser;
 use console::Style;
 use similar::{ChangeTag, InlineChangeMode, InlineChangeOptions, TextDiff};
 use std::fmt::{Display, Write};
+use std::path::PathBuf;
+use std::process::ExitCode;
 use std::sync::Arc;
 
 #[derive(Debug, PartialEq)]
@@ -170,9 +172,54 @@ applications that use the `mezmo_auth` package. Group the report into sections b
 the report to `ops@mezmo.com`.
 "#;
 
-fn main() {
-    let prompt = EXAMPLE_PROMPT;
-    let res = prompt_parser::prompts(prompt).expect("parsing to work");
+/// Parses a prompt and reports the tool and skill references embedded in it.
+#[derive(Parser)]
+#[command(version, about)]
+struct Cli {
+    /// Prompt file to parse, or `-` for stdin. Omit to use the built-in example.
+    prompt_file: Option<PathBuf>,
+}
+
+/// Reads the prompt the user selected, or falls back to the example.
+/// `Err` holds a message already formatted for the user.
+fn load_prompt(prompt_file: Option<PathBuf>) -> Result<String, String> {
+    let Some(path) = prompt_file else {
+        return Ok(EXAMPLE_PROMPT.to_string());
+    };
+
+    // `-` is the conventional spelling for stdin, and makes the tool pipeable.
+    if path.as_os_str() == "-" {
+        let mut buf = String::new();
+        return match std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf) {
+            Ok(_) => Ok(buf),
+            Err(e) => Err(format!("reading stdin: {e}")),
+        };
+    }
+
+    match std::fs::read_to_string(&path) {
+        Ok(text) => Ok(text),
+        Err(e) => Err(format!("reading {}: {e}", path.display())),
+    }
+}
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+
+    let prompt = match load_prompt(cli.prompt_file) {
+        Ok(loaded) => loaded,
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let res = match prompt_parser::prompts(&prompt) {
+        Ok(res) => res,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let mut content = Vec::new();
     let mut tools = Vec::new();
@@ -190,10 +237,14 @@ fn main() {
         }
     }
 
-    let diff = render_inline_diff(prompt, &xformed_prompt);
+    let diff = render_inline_diff(&prompt, &xformed_prompt);
 
     println!(
         r#"
+Input Prompt
+------------
+{prompt}
+
 PromptElement::PromptContent
 ----------------------------
 {content:#?}
@@ -214,4 +265,6 @@ Prompt Diff
 {diff}
 "#
     );
+
+    ExitCode::SUCCESS
 }

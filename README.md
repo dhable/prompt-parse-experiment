@@ -20,11 +20,11 @@ merely resembles a reference.**
 
 This is the claim the demo prompt is built to attack. `@` on its own means nothing;
 it is only significant when immediately followed by a delimiter — `` ` `` for a tool,
-`(` for a skill (`tool_ref_start()` and `skill_ref_start()`, `src/main.rs:72,80`).
+`(` for a skill (`tool_ref_start()` and `skill_ref_start()`, `src/main.rs:75,83`).
 That requirement is what lets `ops@mezmo.com` sail through as literal content.
 Backticks alone are not a reference either, so `` `not_a_tool:just_documentation` ``
 stays prose. And fenced blocks are swallowed whole by `code_block_fence()`
-(`src/main.rs:86`) before reference scanning can ever reach inside them, so
+(`src/main.rs:89`) before reference scanning can ever reach inside them, so
 ` ```not_a_tool:just_a_block``` ` is safe too. A prompt should be able to *talk about*
 tools, paths, and email addresses without accidentally *invoking* them.
 
@@ -40,7 +40,7 @@ fail at runtime, deep inside a turn. References that parse can fail at load time
 
 `` @`k8s:*` `` is a single reference that names a family. The namespace and the name
 each accept the same glob vocabulary — wildcards, character classes, alternation
-(`src/main.rs:56-64`) — that permission rules already use. If prompt authoring and
+(`src/main.rs:59-67`) — that permission rules already use. If prompt authoring and
 permission configuration share one pattern language, "which tools may this prompt
 use" and "which tools does this prompt talk about" become the same question, asked
 in the same syntax.
@@ -69,7 +69,7 @@ element may be a plain literal or a glob:
 
 So `` @`k8s:get_{pod,deployment}` `` and `` @`mezmo_*:describe` `` are both
 well-formed. Literal elements are capped at 64 characters (`literal_element()`,
-`src/main.rs:63`), matching the tool-name length limit the major model providers
+`src/main.rs:66`), matching the tool-name length limit the major model providers
 enforce.
 
 A skill reference is a path inside parentheses: `@(skills/audit-report.md)`.
@@ -149,14 +149,30 @@ live question rather than a settled one.
 
 ## Running it
 
+With no argument it parses the built-in example prompt:
+
 ```sh
 cargo run
+```
+
+Pass a file to parse your own prompt, or `-` to read stdin:
+
+```sh
+cargo run -- path/to/prompt.txt
+echo 'deploy with @`k8s:apply`' | cargo run -- -
 ```
 
 Colors are dropped automatically when stdout is not a terminal; set `CLICOLOR_FORCE=1`
 to force them through a pipe.
 
-The demo prompt is hardcoded in `main()` (`src/main.rs:150`). Abridged output:
+A malformed reference is reported with its position rather than panicking:
+
+```
+$ cargo run -- bad.txt
+error: bad.txt: error at 1:21: expected one of "*", ":", "?", "[", "{", [...]
+```
+
+Abridged output for the example prompt:
 
 ```
 PromptElement::ToolRef
