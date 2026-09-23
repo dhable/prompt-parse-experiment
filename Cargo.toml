@@ -1,0 +1,9 @@
+[package]
+name = "prompt-parse-experiment"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+console = "0.16"
+peg = "0.8.6"
+similar = { version = "3.2.0", features = ["inline"] }
