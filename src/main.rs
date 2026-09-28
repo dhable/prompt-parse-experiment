@@ -2,6 +2,7 @@ use clap::Parser;
 use console::Style;
 use similar::{ChangeTag, InlineChangeMode, InlineChangeOptions, TextDiff};
 use std::fmt::{Display, Write};
+use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -35,6 +36,7 @@ enum PromptElement {
     PromptContent(Arc<str>),
     ToolRef { ns: ToolNamespace, name: ToolName },
     SkillRef { name: SkillName },
+    IncludeRef { path: PathBuf },
 }
 impl Display for PromptElement {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -48,12 +50,43 @@ impl Display for PromptElement {
                 f.write_char('`')
             }
             Self::SkillRef { name } => name.fmt(f),
+            Self::IncludeRef { path } => {
+                let content = fs::read_to_string(&path).expect("should be able to read the file");
+                f.write_str(&content)
+            }
         }
     }
 }
 
+/// A comment that vanishes mid-sentence leaves two `PromptContent` runs where the
+/// prompt had one. Fold them back together so the element list mirrors the prose.
+/// `flatten` is what discards the comments' `None`s.
+fn coalesce(parts: Vec<Option<PromptElement>>) -> Vec<PromptElement> {
+    let mut out: Vec<PromptElement> = Vec::new();
+    for part in parts.into_iter().flatten() {
+        if let PromptElement::PromptContent(next) = &part {
+            // Borrow ends at the `continue`, so the `push` below stays legal.
+            if let Some(PromptElement::PromptContent(prev)) = out.last_mut() {
+                *prev = format!("{prev}{next}").into();
+                continue;
+            }
+        }
+        out.push(part);
+    }
+    out
+}
+
 peg::parser! {
     grammar prompt_parser() for str {
+        // File system path definition. The prompt file path syntax does not support relative
+        // parent directory or absolute path syntax to sandbox what the prompt can reference.
+        rule inner_name()      = ['a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-']+
+        rule extension()       = ['a'..='z' | 'A'..='Z' | '0'..='9']+
+        rule file_name()       = inner_name() ("." extension())?
+        rule dir_name()        = inner_name() "/"
+        rule path() -> &'input str
+                               = path:$(dir_name()+ file_name()? / file_name()) { path }
+
         // Embedded tool name patterns
         rule literal_char()    = ['a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-' | '/' | '.']
         rule wildcard()        = "*" / "?"
@@ -64,35 +97,55 @@ peg::parser! {
         rule glob_element()    = literal_char()* glob_match() (literal_char() / glob_match())*
         rule literal_element() = literal_char()*<1,64>
         rule element()         = glob_element() / literal_element()
-
-        rule ns_pattern() -> ToolNamespace = ns:$element() ":" { ToolNamespace(ns.into()) }
-        rule name_pattern() -> ToolName = n:$element() { ToolName(n.into()) }
+        rule ns_pattern() -> ToolNamespace
+                               = ns:$element() ":" { ToolNamespace(ns.into()) }
+        rule name_pattern() -> ToolName
+                               = n:$element() { ToolName(n.into()) }
         rule tool_fqn() -> PromptElement
-            =  ns:ns_pattern() name:name_pattern() { PromptElement::ToolRef { ns, name }
-        }
+                               = ns:ns_pattern() name:name_pattern() { PromptElement::ToolRef { ns, name } }
 
-        rule tool_ref_start() = "@`"
-        rule tool_ref() -> PromptElement = tool_ref_start() t:tool_fqn() "`" { t }
+        // Structured prompt commands
+        rule sigil()           = "@"
+        rule tool_ref() -> PromptElement
+                               = sigil() "`" t:tool_fqn() "`" { t }
+        rule include_ref() -> PromptElement
+                               = sigil() "{" p:path() "}" { PromptElement::IncludeRef { path: p.into() } }
+        rule skill_ref() -> PromptElement
+                               = sigil() "(" name:path() ")" { PromptElement::SkillRef { name: SkillName(name.into()) } }
+        rule prompt_commands() -> PromptElement
+                               = tool_ref() / skill_ref() / include_ref()
 
-        // Embedded skill patterns
-        rule skill_path() -> PromptElement
-            = name:$(['a'..='z' | 'A'..='Z' | '0'..='9' | '/' | '.' | '_' | '-']*) {
-                PromptElement::SkillRef { name: SkillName(name.into()) }
-            }
-        rule skill_ref_start() = "@("
-        rule skill_ref() -> PromptElement = skill_ref_start() s:skill_path() ")" { s }
+        // Comments do not nest, so the body stops at the first closer. comment_open() guards
+        // content while comment() consumes it; the gap between the two is deliberate, and is
+        // what makes an unterminated comment an error instead of prose. Keep them in sync.
+        rule comment_open()    = "<!--"
+        rule comment()         = comment_open() (!"-->" [_])* "-->"
 
+        // A comment inside command delimiters is an error, not prose: refusing the span
+        // leaves the position unconsumable. Requiring the closer keeps a stray `@{` from
+        // tripping it; !comment_open() stops peg's greedy `*` from scanning past the comment.
+        rule commented_command()
+                               = sigil() "`" (!("`" / "\n") !comment_open() [_])* comment_open() (!("`" / "\n") [_])* "`"
+                               / sigil() "(" (!(")" / "\n") !comment_open() [_])* comment_open() (!(")" / "\n") [_])* ")"
+                               / sigil() "{" (!("}" / "\n") !comment_open() [_])* comment_open() (!("}" / "\n") [_])* "}"
 
         // prompt literal content
-        rule ref_start() = tool_ref_start() / skill_ref_start()
-        rule code_block_fence() = "```" (!"```" [_])* "```"
-        rule content_char() = code_block_fence() / (!ref_start() [_])
+        rule code_block_fence()
+                               = "```" (!"```" [_])* "```"
+        rule content_char()    = code_block_fence()
+                               / (!prompt_commands() !comment_open() !commented_command() [_])
         rule content_literal() -> PromptElement
-            = c:$(content_char()+) { PromptElement::PromptContent(c.into()) }
+                               = c:$(content_char()+) { PromptElement::PromptContent(c.into()) }
+
+        // A comment parses to None: consumed from the stream, never emitted. Everything
+        // else carries a value through, and coalesce() drops the Nones.
+        rule prompt_part() -> Option<PromptElement>
+                               = comment() { None }
+                               / e:(prompt_commands() / content_literal()) { Some(e) }
 
         // refs must come first: content_literal() would otherwise always win.
         pub rule prompts() -> Vec<PromptElement>
-            = (tool_ref() / skill_ref() / content_literal())*
+                               = parts:prompt_part()* { coalesce(parts) }
     }
 }
 
@@ -151,20 +204,22 @@ const EXAMPLE_PROMPT: &'static str = r#"
 You are a site reliability engineering agent. The goal of our SRE team is to ensure quick
 resolution to system issues with minimal downtime. Our stack includes:
 
-    * Kubernetes
-    * Postgres
-    * MongoDB
-    * node.js business services
-    * rust business services
-    * Apache Pulsar
+<!--
+    the list of services are maintained by a cron script. instead of splicing them into each
+    prompt, we can just use the include syntax to bring them into the prompt script.
+-->
+@{sample/snippets/service_def.md}
 
 When inspecting the business services, you should be able to use the @`mezmo_internal:describe` tool in order to
 find out service specific details. Always include a kubernetes namespace on all @`k8s:*` tools. Fall back to
 the `find_service` tool if @`mezmo_internal:describe` returns no results.
 
-```not_a_tool:just_a_block```
+```
+<!-- this isn't a comment since it's in a code block -->
+<h1>Code Block</h1>
+```
 
-`not_a_tool:just_documentation`
+`not_a_tool:just_documentation` <!-- another comment -->
 
 Generate a report using @(skills/audit-report.md) of deployed node.js services that have a trace calling the
 `internal_mezmo_auth` function in the `mezmo_auth` package. You might also need to look at deployed infra for sidecar
@@ -224,6 +279,7 @@ fn main() -> ExitCode {
     let mut content = Vec::new();
     let mut tools = Vec::new();
     let mut skills = Vec::new();
+    let mut includes = Vec::new();
     let mut xformed_prompt = String::new();
 
     for element in &res {
@@ -234,6 +290,9 @@ fn main() -> ExitCode {
                 tools.push(format!("ns={}, name={}", ns.0.as_ref(), name.0.as_ref()))
             }
             PromptElement::SkillRef { name } => skills.push(name.0.as_ref()),
+            PromptElement::IncludeRef { path } => {
+                includes.push(path.to_str().expect("only use ascii paths"))
+            }
         }
     }
 
@@ -254,7 +313,12 @@ PromptElement::ToolRef
 {tools:#?}
 
 PromptElement::SkillRef
+-----------------------
 {skills:#?}
+
+PromptElement::IncludeRef
+-------------------------
+{includes:#?}
 
 Transpiled Prompt
 -----------------
