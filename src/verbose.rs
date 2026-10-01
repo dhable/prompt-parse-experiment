@@ -1,41 +1,35 @@
 //-------------------------------------------------------------------------------------------
 // The verbose grammar parser and example prompt
 //-------------------------------------------------------------------------------------------
-use crate::ast::{PromptElement, SkillName, ToolName, ToolNamespace, coalesce};
+use crate::ast::{PromptElement, coalesce};
 
 peg::parser! {
     pub grammar prompt_parser() for str {
         // File system path definition. The prompt file path syntax does not support relative
-        // parent directory or absolute path syntax to sandbox what the prompt can reference.
-        rule inner_name()      = ['a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-']+
+        // parent directory, absolute path, or directory syntax to sandbox what the prompt can
+        // reference.
+        rule name()            = ['a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-']+
         rule extension()       = ['a'..='z' | 'A'..='Z' | '0'..='9']+
-        rule file_name()       = inner_name() ("." extension())?
-        rule dir_name()        = inner_name() "/"
         rule path() -> &'input str
-                               = path:$(dir_name()+ file_name()? / file_name()) { path }
+                               = $(name() ++ "/" ("." extension())?)
 
-        // Embedded tool name patterns
+        // Embedded tool name patterns. Literals and glob syntax match in a single pass.
         rule literal_char()    = ['a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-' | '/' | '.']
         rule wildcard()        = "*" / "?"
         rule class_match()     = "[" "!"? literal_char()+ "]"
         rule alt_branch()      = (literal_char() / wildcard() / class_match())*
         rule alt_match()       = "{" alt_branch() ++ "," "}"
-        rule glob_match()      = wildcard() / class_match() / alt_match()
-        rule glob_element()    = literal_char()* glob_match() (literal_char() / glob_match())*
-        rule literal_element() = literal_char()*<1,64>
-        rule element()         = glob_element() / literal_element()
-        rule ns_pattern() -> ToolNamespace
-                               = ns:$element() ":" { ToolNamespace(ns.into()) }
-        rule name_pattern() -> ToolName
-                               = n:$element() { ToolName(n.into()) }
+        rule pattern() -> &'input str
+                               = $((literal_char() / wildcard() / class_match() / alt_match())+)
         rule tool_fqn() -> PromptElement
-                               = ns:ns_pattern() name:name_pattern() { PromptElement::ToolRef { ns, name } }
+                               = ns:pattern() ":" name:pattern() { PromptElement::new_tool(ns, name) }
 
-        rule sigil() = "@"
-        rule tool_ref() -> PromptElement = sigil() "Tool(" t:tool_fqn() ")" { t }
-        rule include_ref() -> PromptElement = sigil() "Include(" p:path() ")" { PromptElement::IncludeRef { path: p.into() }}
-        rule skill_ref() -> PromptElement = sigil() "Skill(" p:path() ")" { PromptElement::SkillRef { name: SkillName(p.into()) }}
-        rule prompt_commands() -> PromptElement = tool_ref() / skill_ref() / include_ref()
+        // Structured prompt commands: `@`, a keyword, and a parenthesized argument.
+        rule command() -> PromptElement
+                               = "@" c:( "Tool("    t:tool_fqn() ")" { t }
+                                       / "Skill("   p:path()     ")" { PromptElement::new_skill(p) }
+                                       / "Include(" p:path()     ")" { PromptElement::new_include(p.into()) } )
+                                     { c }
 
         // Comments do not nest, so the body stops at the first closer. comment_open() guards
         // content while comment() consumes it; the gap between the two is deliberate, and is
@@ -43,21 +37,30 @@ peg::parser! {
         rule comment_open()    = "<!--"
         rule comment()         = comment_open() (!"-->" [_])* "-->"
 
-        // prompt literal content
+        // A comment inside a command is an error, not prose: refusing the span leaves the
+        // position unconsumable. Requiring the `)` keeps a stray `@Tool(` from tripping it;
+        // !comment_open() stops peg's greedy `*` from scanning past the comment.
+        rule command_open()    = "@" ("Tool(" / "Skill(" / "Include(")
+        rule commented_command()
+                               = command_open() (!(")" / "\n") !comment_open() [_])* comment_open() (!(")" / "\n") [_])* ")"
+
+        // prompt literal content. text() takes runs that can't start a command, comment, or
+        // fence in one step, so the guards only run at `@`, `<`, and backtick.
         rule code_block_fence()
                                = "```" (!"```" [_])* "```"
-        rule content_char()    = code_block_fence()
-                               / (!prompt_commands() !comment_open() [_])
+        rule text()            = [^ '@' | '<' | '`']+
+        rule content_char()    = text() / code_block_fence()
+                               / (!command() !comment_open() !commented_command() [_])
         rule content_literal() -> PromptElement
-                               = c:$(content_char()+) { PromptElement::PromptContent(c.into()) }
+                               = c:$(content_char()+) { PromptElement::new_content(c) }
 
         // A comment parses to None: consumed from the stream, never emitted. Everything
         // else carries a value through, and coalesce() drops the Nones.
         rule prompt_part() -> Option<PromptElement>
                                = comment() { None }
-                               / e:(prompt_commands() / content_literal()) { Some(e) }
+                               / e:(command() / content_literal()) { Some(e) }
 
-        // refs must come first: content_literal() would otherwise always win.
+        // commands must come first: content_literal() would otherwise always win.
         pub rule prompts() -> Vec<PromptElement>
                                = parts:prompt_part()* { coalesce(parts) }
     }

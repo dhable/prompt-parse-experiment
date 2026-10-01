@@ -6,6 +6,11 @@ use std::sync::Arc;
 
 #[derive(Debug, PartialEq)]
 pub struct ToolNamespace(pub Arc<str>);
+impl From<&str> for ToolNamespace {
+    fn from(value: &str) -> Self {
+        Self(value.into())
+    }
+}
 impl Display for ToolNamespace {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
@@ -14,6 +19,11 @@ impl Display for ToolNamespace {
 
 #[derive(Debug, PartialEq)]
 pub struct ToolName(pub Arc<str>);
+impl From<&str> for ToolName {
+    fn from(value: &str) -> Self {
+        Self(value.into())
+    }
+}
 impl Display for ToolName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
@@ -22,6 +32,11 @@ impl Display for ToolName {
 
 #[derive(Debug, PartialEq)]
 pub struct SkillName(pub Arc<str>);
+impl From<&str> for SkillName {
+    fn from(value: &str) -> Self {
+        Self(value.into())
+    }
+}
 impl Display for SkillName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
@@ -35,6 +50,29 @@ pub enum PromptElement {
     SkillRef { name: SkillName },
     IncludeRef { path: PathBuf },
 }
+
+impl PromptElement {
+    pub fn new_content(content: impl Into<Arc<str>>) -> Self {
+        let content = content.into();
+        Self::PromptContent(content.into())
+    }
+
+    pub fn new_tool(ns: impl Into<ToolNamespace>, name: impl Into<ToolName>) -> Self {
+        Self::ToolRef {
+            ns: ns.into(),
+            name: name.into(),
+        }
+    }
+
+    pub fn new_skill(name: impl Into<SkillName>) -> Self {
+        Self::SkillRef { name: name.into() }
+    }
+
+    pub fn new_include(path: PathBuf) -> Self {
+        Self::IncludeRef { path }
+    }
+}
+
 impl Display for PromptElement {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
